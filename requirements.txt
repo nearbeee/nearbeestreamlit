@@ -1,0 +1,5 @@
+streamlit
+selenium
+pymongo
+python-dotenv
+pandas
