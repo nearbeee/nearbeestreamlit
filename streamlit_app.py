@@ -78,11 +78,35 @@ st.markdown("""
 # ─── CONNECT DB ───────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_collection():
-    # Local:  reads from .env via load_env() above
-    # Cloud:  reads from Streamlit secrets dashboard
-    mongo_url = os.getenv("MONGO_URL") or st.secrets.get("MONGO_URL", "")
-    client = MongoClient(mongo_url)
-    return client["test"]["shops"]
+    # Try multiple sources for MONGO_URL
+    mongo_url = None
+    
+    # 1. Try Streamlit secrets first (for cloud)
+    try:
+        mongo_url = st.secrets["MONGO_URL"]
+    except:
+        pass
+    
+    # 2. Fall back to environment variable (for local)
+    if not mongo_url:
+        mongo_url = os.getenv("MONGO_URL")
+    
+    # 3. Validate
+    if not mongo_url or mongo_url.strip() == "":
+        st.error("❌ MONGO_URL not found in secrets or environment variables!")
+        st.stop()
+    
+    # Clean the URL (remove any accidental whitespace)
+    mongo_url = mongo_url.strip()
+    
+    try:
+        client = MongoClient(mongo_url)
+        # Test connection
+        client.admin.command('ping')
+        return client["test"]["shops"]
+    except Exception as e:
+        st.error(f"❌ MongoDB connection failed: {str(e)}")
+        st.stop()
 
 collection = get_collection()
 
