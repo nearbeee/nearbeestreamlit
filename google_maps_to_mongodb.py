@@ -3,6 +3,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+
+from webdriver_manager.chrome import ChromeDriverManager
+
 from pymongo import MongoClient
 import os
 import time
@@ -12,7 +15,9 @@ from datetime import datetime
 from category_utils import normalize_category
 
 
-# ─── LOAD .env MANUALLY (no python-dotenv needed) ─────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# LOAD .env (local dev only)
+# ──────────────────────────────────────────────────────────────────────────────
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), ".env")
     if os.path.exists(env_path):
@@ -21,22 +26,29 @@ def load_env():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, _, val = line.partition("=")
-                    os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+                    os.environ.setdefault(
+                        key.strip(),
+                        val.strip().strip('"').strip("'")
+                    )
 
 load_env()
 
 MONGO_URL = os.getenv("MONGO_URL")
+if not MONGO_URL:
+    raise RuntimeError("❌ MONGO_URL not found in environment variables")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
 # MONGODB CONNECTION
-
+# ──────────────────────────────────────────────────────────────────────────────
 client = MongoClient(MONGO_URL)
 db = client["test"]
 collection = db["shops"]
 
 
-# CLEAN PHONE
-
+# ──────────────────────────────────────────────────────────────────────────────
+# UTILS
+# ──────────────────────────────────────────────────────────────────────────────
 def clean_phone(phone):
     if not phone:
         return ""
@@ -44,38 +56,47 @@ def clean_phone(phone):
     return phone[-10:]
 
 
-# SCRAPER FUNCTION
-
-def scrape_and_store(search_query):
-
-    url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
-
-    # ── Streamlit Cloud-compatible Chrome options ──────────────────────────────
+def get_driver():
+    """
+    Streamlit-Cloud-safe Chrome driver
+    """
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--log-level=3")
 
-    # Try system chromedriver first (Streamlit Cloud), fall back to local .exe
-    try:
-        driver = webdriver.Chrome(options=options)
-    except Exception:
-        service = Service("chromedriver.exe")
-        driver = webdriver.Chrome(service=service, options=options)
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN SCRAPER
+# ──────────────────────────────────────────────────────────────────────────────
+def scrape_and_store(search_query: str):
+
+    driver = get_driver()
     wait = WebDriverWait(driver, 20)
+
+    url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
+    print(f"🔍 SCRAPING STARTED: {search_query}")
 
     driver.get(url)
     time.sleep(6)
 
-    scroll_div = wait.until(
-        EC.presence_of_element_located(
-            (By.XPATH, "//div[contains(@aria-label,'Results')]")
+    try:
+        scroll_div = wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//div[contains(@aria-label,'Results')]")
+            )
         )
-    )
+    except Exception as e:
+        driver.quit()
+        raise RuntimeError("❌ Google Maps layout changed or blocked") from e
 
+    # Scroll results
     for _ in range(12):
         driver.execute_script(
             "arguments[0].scrollTop = arguments[0].scrollHeight",
@@ -84,7 +105,7 @@ def scrape_and_store(search_query):
         time.sleep(2)
 
     shops = driver.find_elements(By.CSS_SELECTOR, "div[role='article']")
-    print(f" SCRAPING STARTED: {search_query}")
+    print(f"📦 FOUND {len(shops)} SHOPS")
 
     for shop in shops:
         try:
@@ -97,21 +118,24 @@ def scrape_and_store(search_query):
             if not lat or not lng:
                 continue
 
-            #  DUPLICATE CHECK
-            existing = collection.find_one({
-                "shopName": shop_name,
-                "latitude": float(lat.group(1)),
-                "longitude": float(lng.group(1))
-            })
+            latitude = float(lat.group(1))
+            longitude = float(lng.group(1))
 
-            if existing:
+            # DUPLICATE CHECK
+            if collection.find_one({
+                "shopName": shop_name,
+                "latitude": latitude,
+                "longitude": longitude
+            }):
                 print(f"⏭️ DUPLICATE SKIPPED: {shop_name}")
                 continue
 
+            # Open detail page
             driver.execute_script("window.open(arguments[0]);", href)
             driver.switch_to.window(driver.window_handles[1])
             time.sleep(4)
 
+            # CATEGORY
             try:
                 raw_category = driver.find_element(
                     By.XPATH, "//button[contains(@jsaction,'category')]"
@@ -121,6 +145,7 @@ def scrape_and_store(search_query):
 
             category = normalize_category(raw_category)
 
+            # PHONE
             try:
                 raw_phone = driver.find_element(
                     By.XPATH, "//button[contains(@aria-label,'Phone')]"
@@ -129,6 +154,7 @@ def scrape_and_store(search_query):
             except:
                 contact = ""
 
+            # ADDRESS
             try:
                 address = driver.find_element(
                     By.XPATH, "//button[@data-item-id='address']"
@@ -136,6 +162,7 @@ def scrape_and_store(search_query):
             except:
                 address = ""
 
+            # IMAGE
             try:
                 image = driver.find_element(
                     By.XPATH, "//img[contains(@src,'googleusercontent.com')]"
@@ -148,7 +175,6 @@ def scrape_and_store(search_query):
 
             now = datetime.utcnow().isoformat() + "Z"
 
-            # FORMAT
             shop_data = {
                 "ownerName": "NA",
                 "shopName": shop_name,
@@ -156,8 +182,8 @@ def scrape_and_store(search_query):
                 "email": "NA",
                 "category": category,
                 "address": address,
-                "latitude": float(lat.group(1)),
-                "longitude": float(lng.group(1)),
+                "latitude": latitude,
+                "longitude": longitude,
                 "shopImage": image,
                 "createdAt": now,
                 "updatedAt": now,
@@ -167,7 +193,8 @@ def scrape_and_store(search_query):
             print(f"✅ INSERTED: {shop_name}")
 
         except Exception as e:
-            print("❌ ERROR:", e)
+            print(f"❌ ERROR processing shop: {e}")
+            continue
 
     driver.quit()
-    print("SCRAPING DONE")
+    print("🎉 SCRAPING DONE")
